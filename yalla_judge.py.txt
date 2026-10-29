@@ -1,0 +1,510 @@
+#!/usr/bin/env python3
+"""
+Yalla Play! - Python AI judge
+==============================
+Processes a game video (with its audio) and writes a signed judge report that the
+Yalla Play! app can import. The app checks the HMAC-SHA256 signature with your
+match's judge code, and checks the video fingerprint, before it applies anything.
+
+  pip install opencv-python numpy            (required)
+  pip install ultralytics                    (optional: YOLO person/ball detection + ByteTrack)
+  ffmpeg on PATH                             (optional: needed for whistle / GO-beep detection)
+
+  python yalla_judge.py football match.mp4 --config yalla_config.json --key YP-ABCD-1234
+  python yalla_judge.py dhow race1.mp4 --config yalla_config.json --key YP-ABCD-1234
+  python yalla_judge.py karamah turn.mp4 --config yalla_config.json --key YP-ABCD-1234 [--yolo]
+
+Get yalla_config.json from the app's AI judge step ("Download yalla_config.json") after
+marking the goals / lanes / tray spots. It holds the same markings the in-browser judge uses.
+"""
+import argparse, hashlib, hmac, json, math, os, shutil, subprocess, sys, datetime
+import numpy as np
+import cv2
+
+ENGINE = "yalla-python-cv 1.0"
+
+
+def fmt(t):
+    if t is None: return "--:--"
+    m = int(t // 60); return f"{m:02d}:{t - m * 60:04.1f}"
+
+
+# ---------------- colour ----------------
+def hex_rgb(h): n = int(h.lstrip("#"), 16); return ((n >> 16) & 255, (n >> 8) & 255, n & 255)
+
+
+def rgb_hsv(r, g, b):
+    import colorsys
+    h, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255); return h * 360, s, v
+
+
+def matcher(hexc, tol=1.0):
+    th, ts, tv = rgb_hsv(*hex_rgb(hexc))
+    def f(H, S, V):
+        if ts < 0.22: return (S < 0.2 + 0.05 * tol) & (np.abs(V - tv) < 0.13 * tol)
+        d = np.abs(H - th); d = np.minimum(d, 360 - d)
+        return (d < 16 * tol) & (S > max(0.3, ts * 0.55)) & (V > max(0.18, tv * 0.4))
+    return f
+
+
+def planes(bgr):
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV_FULL).astype(np.float32)
+    return hsv[..., 0] * (360 / 256), hsv[..., 1] / 255, hsv[..., 2] / 255
+
+
+def roi_mask(shape, roi):
+    Hh, W = shape; m = np.zeros(shape, bool)
+    if roi is None: m[:] = True; return m
+    x0, x1 = max(0, int(math.floor(roi["x"] * W))), min(W, int(math.ceil((roi["x"] + roi["w"]) * W)))
+    y0, y1 = max(0, int(math.floor(roi["y"] * Hh))), min(Hh, int(math.ceil((roi["y"] + roi["h"]) * Hh)))
+    m[y0:y1, x0:x1] = True; return m
+
+
+def color_mask(P, f, roi=None, dil=False):
+    m = f(*P) & roi_mask(P[0].shape, roi)
+    m = m.astype(np.uint8)
+    if dil: m = cv2.dilate(m, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+    return m
+
+
+def blobs(m, min_px=4):
+    Hh, W = m.shape
+    n, lab, st, cen = cv2.connectedComponentsWithStats(m, connectivity=4)
+    out = []
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a < min_px: continue
+        out.append(dict(cx=cen[i][0] / W, cy=cen[i][1] / Hh, x=x / W, y=y / Hh, w=w / W, h=h / Hh, area=a / (W * Hh), pw=w, ph=h, fill=a / (w * h)))
+    return sorted(out, key=lambda b: -b["area"])
+
+
+def count_in(m, r):
+    Hh, W = m.shape
+    x0, x1 = max(0, int(math.floor(r["x"] * W))), min(W, int(math.ceil((r["x"] + r["w"]) * W)))
+    y0, y1 = max(0, int(math.floor(r["y"] * Hh))), min(Hh, int(math.ceil((r["y"] + r["h"]) * Hh)))
+    sub = m[y0:y1, x0:x1]; return float(sub.mean()) if sub.size else 0.0
+
+
+def in_rect(r, x, y, pad=0): return r["x"] - pad <= x <= r["x"] + r["w"] + pad and r["y"] - pad <= y <= r["y"] + r["h"] + pad
+
+
+# ---------------- video ----------------
+class Frames:
+    def __init__(self, path, width=480):
+        self.cap = cv2.VideoCapture(path)
+        if not self.cap.isOpened(): sys.exit(f"Can't open video: {path}")
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 25
+        n = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        self.duration = n / self.fps if n > 0 else 0
+        w, h = self.cap.get(cv2.CAP_PROP_FRAME_WIDTH), self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        self.size = (width, max(2, round(width * h / w)))
+
+    def sample(self, fps):
+        """Decode sequentially, yielding (t, frame) at ~fps samples per second."""
+        step, nxt, k = 1 / fps, 0.0, 0
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        while True:
+            ok, fr = self.cap.read()
+            if not ok: break
+            t = k / self.fps; k += 1
+            if t + 1e-6 >= nxt:
+                nxt += step
+                yield round(t, 3), cv2.resize(fr, self.size, interpolation=cv2.INTER_AREA)
+
+
+# ---------------- audio ----------------
+def load_audio(path, sr=22050):
+    if not shutil.which("ffmpeg"): return None
+    p = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", str(sr), "-f", "f32le", "-"], capture_output=True)
+    if p.returncode or not p.stdout: return None
+    return np.frombuffer(p.stdout, np.float32), sr
+
+
+def analyse_audio(a):
+    if a is None: return dict(hasAudio=False, whistles=[], beeps=[], cheers=[])
+    x, sr = a; N, hop = 1024, 512
+    nf = (len(x) - N) // hop
+    if nf <= 0: return dict(hasAudio=False, whistles=[], beeps=[], cheers=[])
+    idx = np.arange(N)[None, :] + hop * np.arange(nf)[:, None]
+    fr = x[idx]; rms = np.sqrt((fr ** 2).mean(1))
+    mag = np.abs(np.fft.rfft(fr * np.hanning(N), axis=1))[:, :N // 2]
+    b = lambda f: int(round(f * N / sr))
+    band = mag[:, b(300):min(N // 2 - 1, b(8000)) + 1]
+    mean = band.mean(1) + 1e-9; flat = np.exp(np.log(band + 1e-9).mean(1)) / mean
+    wh = (mag[:, b(2000):b(4500) + 1].max(1) / mean > 14) & (rms > 0.01)
+    bp = [((np.max(mag[:, b(f) - 1:b(f) + 2], 1) / mean) > 18) & (rms > 0.01) for f in (880, 1760)]
+    fdt = hop / sr
+
+    def segs(arr, mind, gap=2):
+        out, s, last = [], -1, -1
+        for f in range(len(arr) + 1):
+            if f < len(arr) and arr[f]:
+                if s < 0: s = f
+                last = f
+            elif s >= 0 and f - last > gap:
+                if (last - s + 1) * fdt >= mind: out.append(dict(t=round(s * fdt, 2), dur=round((last - s + 1) * fdt, 2)))
+                s = -1
+        return out
+    med = float(np.median(rms))
+    loud = (rms > max(0.03, med * 3)) & (flat > 0.25)
+    beeps = [dict(**s, f=880) for s in segs(bp[0], 0.1)] + [dict(**s, f=1760) for s in segs(bp[1], 0.25)]
+    return dict(hasAudio=True, whistles=segs(wh, 0.2), beeps=sorted(beeps, key=lambda s: s["t"]), cheers=segs(loud, 0.8, 6), medianRms=round(med, 4))
+
+
+# ---------------- tracking ----------------
+def assign(cost):
+    n = len(cost); m = len(cost[0]) if n else 0
+    best, bestc = [-1] * n, [1e18]
+    if n <= 6 and m <= 8:
+        used, cur = [False] * m, [-1] * n
+        def rec(i, c):
+            if c >= bestc[0]: return
+            if i == n: bestc[0] = c; best[:] = cur; return
+            cur[i] = -1; rec(i + 1, c + 1e3)
+            for j in range(m):
+                if not used[j] and cost[i][j] < 1e3:
+                    used[j] = True; cur[i] = j; rec(i + 1, c + cost[i][j]); used[j] = False
+            cur[i] = -1
+        rec(0, 0); return best
+    pairs = sorted((cost[i][j], i, j) for i in range(n) for j in range(m) if cost[i][j] < 1e3)
+    out, ui, uj = [-1] * n, set(), set()
+    for _, i, j in pairs:
+        if i not in ui and j not in uj: out[i] = j; ui.add(i); uj.add(j)
+    return out
+
+
+def track_team(times, dets, n, seed_idx, seeds):
+    S = len(times); res = [[None] * n for _ in range(S)]; meta = [dict(reacq=[]) for _ in range(n)]
+    def run(order):
+        st = [dict(x=s["x"], y=s["y"], vx=0, vy=0, lastT=times[seed_idx], seen=True) for s in seeds]
+        for k in order:
+            t, D = times[k], dets[k]
+            cost = []
+            for s in st:
+                gap = abs(t - s["lastT"]); px, py = s["x"] + s["vx"] * min(gap, .5), s["y"] + s["vy"] * min(gap, .5)
+                gate = 0.07 + 0.22 * min(gap, 2)
+                cost.append([(lambda d: d if d < gate else 1e3)(math.hypot(d["cx"] - px, (d["cy"] - py) * .75)) for d in D])
+            mt = assign(cost) if D else [-1] * len(st)
+            fwd = 1 if k >= seed_idx else -1
+            for i, s in enumerate(st):
+                j = mt[i]
+                if j >= 0:
+                    d = D[j]; gap = abs(t - s["lastT"]) or 1e-3; re = (not s["seen"]) and gap > 1.5
+                    if re: meta[i]["reacq"].append(round(t, 2))
+                    s["vx"] = (d["cx"] - s["x"]) / gap * fwd * .5 + s["vx"] * .5; s["vy"] = (d["cy"] - s["y"]) / gap * fwd * .5 + s["vy"] * .5
+                    s.update(x=d["cx"], y=d["cy"], lastT=t, seen=True)
+                    res[k][i] = dict(x=d["cx"], y=d["cy"], w=d["w"], h=d["h"], bx=d["x"], by=d["y"], unsure=re)
+                else:
+                    s["seen"] = False; s["vx"] *= .5; s["vy"] *= .5
+    run(range(seed_idx, S)); run(range(seed_idx - 1, -1, -1))
+    return res, meta
+
+
+# ---------------- football ----------------
+def colour_groups(players, teams):
+    """Family football: everyone may wear different clothes. Players in similar colours share a
+    group; inside a group the slot tracker tells them apart by movement."""
+    groups = []
+    for p in players:
+        col = p.get("color") or teams[p["team"]]["color"]; h, s, v = rgb_hsv(*hex_rgb(col))
+        for g in groups:
+            gh, gs, gv = g["hsv"]
+            same = (gs < .22 and s < .22 and abs(gv - v) < .15) if (gs < .22 or s < .22) else min(abs(gh - h), 360 - abs(gh - h)) < 18
+            if same: g["members"].append(p); break
+        else: groups.append(dict(key=f"g{len(groups)}", color=col, hsv=(h, s, v), members=[p]))
+    return groups
+
+
+def football(path, cfg, au, use_yolo):
+    F = Frames(path); fps = cfg.get("fps", 8)
+    groups = colour_groups(cfg["players"], cfg["teams"]); keys = [g["key"] for g in groups]
+    M = {g["key"]: matcher(g["color"], cfg.get("tol", 1)) for g in groups}
+    ballM = matcher(cfg["ballColor"], cfg.get("tol", 1)); pitch = cfg.get("pitch") or dict(x=0, y=0, w=1, h=1)
+    roi = dict(x=pitch["x"] - .04, y=pitch["y"] - .08, w=pitch["w"] + .08, h=pitch["h"] + .12)
+    minA = cfg.get("minPlayerArea", 0.0005)
+    yolo = None
+    if use_yolo:
+        try:
+            from ultralytics import YOLO; yolo = YOLO("yolov8n.pt"); print("Using YOLOv8n + ByteTrack for people and the ball")
+        except Exception as e: print("YOLO not available, using colour detection:", e)
+    times, dets, balls, last = [], {k: [] for k in keys}, [], None
+    for t, fr in F.sample(fps):
+        times.append(t); P = planes(fr)
+        if yolo is not None:
+            r = yolo.track(fr, persist=True, tracker="bytetrack.yaml", classes=[0, 32], verbose=False)[0]
+            Hh, W = fr.shape[:2]; per = {k: [] for k in keys}; bl = None
+            for (x0, y0, x1, y1), c in zip(r.boxes.xyxy.cpu().numpy(), r.boxes.cls.cpu().numpy()):
+                if int(c) == 32: bl = dict(x=(x0 + x1) / 2 / W, y=(y0 + y1) / 2 / Hh); continue
+                ty0, ty1 = int(y0 + (y1 - y0) * .15), int(y0 + (y1 - y0) * .5)   # upper-body band
+                sub = [p[ty0:ty1, int(x0):int(x1)] for p in P]
+                if sub[0].size == 0: continue
+                frac = {k: float(M[k](*sub).mean()) for k in keys}
+                k = max(frac, key=frac.get)
+                if frac[k] < .15: continue
+                tx0, tw = x0 / W, (x1 - x0) / W
+                per[k].append(dict(cx=(x0 + x1) / 2 / W, cy=(ty0 + ty1) / 2 / Hh, x=tx0, y=ty0 / Hh, w=tw, h=(ty1 - ty0) / Hh, area=tw * (ty1 - ty0) / Hh))
+            for k in keys: dets[k].append(per[k])
+            if bl is None:
+                c = [b for b in blobs(color_mask(P, ballM, roi), 2) if b["area"] < .004 and b["fill"] > .4 and .5 < b["pw"] / b["ph"] < 2]
+                bl = dict(x=c[0]["cx"], y=c[0]["cy"]) if c else None
+            balls.append(bl); continue
+        for k in keys:
+            dets[k].append([b for b in blobs(color_mask(P, M[k], roi, True), 3) if minA <= b["area"] < .08 and b["fill"] > .25 and .4 < b["ph"] / b["pw"] < 5])
+        c = [b for b in blobs(color_mask(P, ballM, roi), 2) if b["area"] < .004 and b["fill"] > .4 and .5 < b["pw"] / b["ph"] < 2]
+        if last and len(c) > 1: c.sort(key=lambda b: math.hypot(b["cx"] - last["cx"], b["cy"] - last["cy"]))
+        balls.append(dict(x=c[0]["cx"], y=c[0]["cy"]) if c else None)
+        if c: last = c[0]
+        if len(times) % 40 == 0: print(f"  frame sample {len(times)} at {fmt(t)}")
+    players = cfg["players"]; tracks, lim = {}, []
+    for g in groups:
+        tm, roster = g["key"], g["members"]; n = len(roster); ids = {p["id"] for p in roster}
+        tags = [x for x in cfg.get("tags", []) if x["pid"] in ids]
+        if tags:
+            tref = tags[0]["t"]; si = min(range(len(times)), key=lambda i: abs(times[i] - tref))
+            seeds = []
+            for i, p in enumerate(roster):
+                tg = next((x for x in tags if x["pid"] == p["id"]), None)
+                seeds.append(dict(x=tg["x"], y=tg["y"]) if tg else dict(x=.2 + .6 * i / max(1, n - 1), y=.5))
+        else:
+            si = next((i for i, d in enumerate(dets[tm]) if len(d) >= n), 0)
+            seeds = [dict(x=d["cx"], y=d["cy"]) for d in sorted(dets[tm][si][:n], key=lambda d: d["cx"])] if dets[tm] else []
+            while len(seeds) < n: seeds.append(dict(x=.5, y=.5))
+            lim.append(f"{', '.join(p['name'] for p in roster)} weren't clicked in the app, so identities were guessed at {fmt(times[si])}.")
+        if n > 1: lim.append(f"{' and '.join(p['name'] for p in roster)} wear similar colours; told apart by movement. Check identity when they cross.")
+        pos, meta = track_team(times, dets[tm], n, si, seeds); tracks[tm] = dict(roster=roster, pos=pos, meta=meta)
+    allp = [(g["key"], i, p) for g in groups for i, p in enumerate(tracks[g["key"]]["roster"])]
+    stats = {p["id"]: dict(pid=p["id"], possession=0, touches=0, passes=0, passesRecv=0, wins=0, goals=0, assists=0, reacq=tracks[tm]["meta"][i]["reacq"]) for tm, i, p in allp}
+    dt = 1 / fps; poss = []
+    for k in range(len(times)):
+        b = balls[k]; best, bd = None, 1e9
+        bp_, bn_ = balls[k - 1] if k else None, balls[k + 1] if k + 1 < len(balls) else None
+        bv = ((bn_["x"] - bp_["x"]) * fps / 2, (bn_["y"] - bp_["y"]) * fps / 2) if bp_ and bn_ else None
+        if b:
+            for tm, i, p in allp:
+                s = tracks[tm]["pos"][k][i]
+                if not s: continue
+                if bv:
+                    sp = tracks[tm]["pos"][k - 1][i] if k else None; sn = tracks[tm]["pos"][k + 1][i] if k + 1 < len(times) else None
+                    pv = ((sn["x"] - sp["x"]) * fps / 2, (sn["y"] - sp["y"]) * fps / 2) if sp and sn else (0, 0)
+                    if math.hypot(bv[0] - pv[0], (bv[1] - pv[1]) * .6) > .15: continue
+                d = math.hypot(b["x"] - s["x"], b["y"] - (s["y"] + s["h"] * .4))
+                if d < max(.05, s["h"] * 1.7) and d < bd: bd, best = d, p["id"]
+        poss.append(best)
+    holder = [p if p and ((k and poss[k - 1] == p) or (k + 1 < len(poss) and poss[k + 1] == p)) else None for k, p in enumerate(poss)]
+    team_of = {p["id"]: p["team"] for tm, i, p in allp}; tposs = dict(A=0, B=0); spells, prev, prevT = [], None, -1e9
+    for k, h in enumerate(holder):
+        if not h: continue
+        stats[h]["possession"] += dt; tposs[team_of[h]] += dt
+        if h != prev:
+            stats[h]["touches"] += 1
+            if prev and times[k] - prevT < 4:
+                if team_of[prev] == team_of[h]: stats[prev]["passes"] += 1; stats[h]["passesRecv"] += 1
+                else: stats[h]["wins"] += 1
+            spells.append(dict(pid=h, t=times[k]))
+        prev, prevT = h, times[k]
+    L, Wm = cfg.get("pitchLen", 20), cfg.get("pitchWid", 12)
+    for tm, i, p in allp:
+        P_ = tracks[tm]["pos"]; d = tr = 0
+        for k in range(1, len(times)):
+            s0, s1 = P_[k - 1][i], P_[k][i]
+            if s1: tr += dt
+            if s0 and s1:
+                st = math.hypot((s1["x"] - s0["x"]) / pitch["w"] * L, (s1["y"] - s0["y"]) / pitch["h"] * Wm)
+                if st < 9 * dt: d += st
+        stats[p["id"]].update(distM=round(d, 1), tracked=round(tr, 1), possession=round(stats[p["id"]]["possession"], 2))
+    events = []
+    def ev(**e): events.append(dict(id=f"e{len(events) + 1}", status="ai", **e))
+    name = lambda pid: next((p["name"] for p in players if p["id"] == pid), pid)
+    goals = [dict(rect=cfg[k], defends=d) for k, d in (("goalA", "A"), ("goalB", "B")) if cfg.get(k)]
+    lock = -1
+    for k in range(1, len(times)):
+        if times[k] < lock:
+            if balls[k] and any(in_rect(g["rect"], balls[k]["x"], balls[k]["y"], .01) for g in goals): lock = times[k] + 2
+            continue
+        for g in goals:
+            b0, b1 = balls[k - 1], balls[k]
+            if b0 and b1 and in_rect(g["rect"], b0["x"], b0["y"], .005) and in_rect(g["rect"], b1["x"], b1["y"], .005):
+                tg, scoring = times[k - 1], "B" if g["defends"] == "A" else "A"
+                inside = 0; j = k - 1
+                while j < len(times) and balls[j] and in_rect(g["rect"], balls[j]["x"], balls[j]["y"], .01): inside += 1; j += 1
+                approach = sum(1 for j in range(k - 2, -1, -1) if times[j] > tg - 1.5 and balls[j])
+                recent = [s for s in spells if tg - 5 < s["t"] <= tg]; last_s = recent[-1] if recent else None
+                scorer = assist = None; own = False; why = []
+                if last_s and team_of[last_s["pid"]] == scoring:
+                    scorer = last_s["pid"]; si = spells.index(last_s); pv = spells[si - 1] if si else None
+                    if pv and pv["pid"] != scorer and team_of[pv["pid"]] == scoring and last_s["t"] - pv["t"] < 8: assist = pv["pid"]
+                elif last_s: own = True
+                aud = [s for s in au["whistles"] + au["cheers"] if tg - .5 <= s["t"] <= tg + 4]
+                c = .55 + (.15 if approach >= 3 else 0) + (.15 if inside >= 3 else 0) + (.1 if aud else 0)
+                why.append(f"ball tracked into {cfg['teams'][g['defends']]['name']}'s goal and stayed in for {inside / fps:.1f}s")
+                why.append("ball seen on its way in" if approach >= 3 else "ball barely seen on approach")
+                if aud: why.append(f"sound heard {aud[0]['t'] - tg:.1f}s later")
+                if own: why.append("last touch by the defending team, possible own goal"); c = min(c, .7)
+                ev(t=round(tg, 2), type="goal", team=scoring, pid=scorer, assist=assist, conf=round(min(.98, c), 2), reason="; ".join(why))
+                if scorer: stats[scorer]["goals"] += 1
+                if assist: stats[assist]["assists"] += 1
+                lock = tg + 3; break
+    outlock = -1
+    for k in range(1, len(times)):
+        b0, b1 = balls[k - 1], balls[k]
+        if not b0 or not b1 or times[k] < outlock: continue
+        out = lambda b: not in_rect(pitch, b["x"], b["y"], .005) and not any(in_rect(g["rect"], b["x"], b["y"], .02) for g in goals)
+        if out(b0) and out(b1):
+            ls = [s for s in spells if s["t"] <= times[k]]; ls = ls[-1] if ls else None
+            ev(t=round(times[k - 1], 2), type="out", team=team_of[ls["pid"]] if ls else None, pid=ls["pid"] if ls else None, conf=.6, reason="ball left the marked pitch" + (f"; last touch looked like {name(ls['pid'])}" if ls else ""))
+            outlock = times[k] + 3
+    clock = {}
+    for k in range(1, len(times)):
+        for ga, ia, a in [x for x in allp if x[2]["team"] == "A"]:
+            for gb, ib, b in [x for x in allp if x[2]["team"] == "B"]:
+                s0, s1, r0, r1 = tracks[ga]["pos"][k - 1][ia], tracks[ga]["pos"][k][ia], tracks[gb]["pos"][k - 1][ib], tracks[gb]["pos"][k][ib]
+                if not (s0 and s1 and r0 and r1) or clock.get(a["id"] + b["id"], -1) > times[k]: continue
+                hh = (s1["h"] + r1["h"]) / 2
+                if math.hypot(s0["x"] - r0["x"], s0["y"] - r0["y"]) < hh * .55 and math.hypot(s1["x"] - r1["x"], s1["y"] - r1["y"]) < hh * .55:
+                    ev(t=round(times[k - 1], 2), type="contact", team=None, pid=a["id"], pid2=b["id"], conf=.4, reason=f"{a['name']} and {b['name']} were in close contact. The host decides if it was a foul.")
+                    clock[a["id"] + b["id"]] = times[k] + 4
+    for w in au["whistles"]: ev(t=w["t"], type="whistle", conf=.8, reason=f"whistle-like tone for {w['dur']}s")
+    for c in au["cheers"]: ev(t=c["t"], type="cheer", conf=.5, reason=f"loud cheering/noise for {c['dur']}s (supporting evidence only)")
+    events.sort(key=lambda e: e["t"])
+    seen = sum(1 for b in balls if b) / max(1, len(times))
+    if seen < .5: lim.append(f"Ball only visible in {round(seen * 100)}% of frames.")
+    for tm, i, p in allp:
+        if tracks[tm]["meta"][i]["reacq"]: lim.append(f"{p['name']} lost and re-found at {', '.join(map(fmt, tracks[tm]['meta'][i]['reacq']))}. Check identity there.")
+    if not au["hasAudio"]: lim.append("No audio (or ffmpeg missing): whistle and cheer evidence unavailable.")
+    lim.append("Offside, handballs and fouls can't be judged reliably from one camera, so they are left to the host.")
+    overlay = [dict(t=t, p=[[p["id"], round(s["bx"], 4), round(s["by"], 4), round(s["w"], 4), round(s["h"], 4), 1 if s["unsure"] else 0] for tm, i, p in allp if (s := tracks[tm]["pos"][k][i])],
+                    b=[round(balls[k]["x"], 4), round(balls[k]["y"], 4)] if balls[k] else None) for k, t in enumerate(times)]
+    facts = dict(possession=dict(A=round(tposs["A"], 1), B=round(tposs["B"], 1)), ballVisible=round(seen, 2), players=stats, fps=fps, samples=len(times), detector="yolov8n+bytetrack" if yolo else "colour")
+    return F, dict(facts=facts, events=events, limitations=lim, audio=dict(hasAudio=au["hasAudio"], whistles=len(au["whistles"]), cheers=len(au["cheers"]))), overlay
+
+
+# ---------------- dhow ----------------
+def dhow(path, cfg, au, _):
+    F = Frames(path); fps = cfg.get("fps", 15); lanes = dict(A=cfg["laneA"], B=cfg["laneB"])
+    M = dict(A=matcher(cfg["boatA"], cfg.get("tol", 1)), B=matcher(cfg["boatB"], cfg.get("tol", 1)))
+    u = dict(x=min(lanes["A"]["x"], lanes["B"]["x"]) - .03, y=min(lanes["A"]["y"], lanes["B"]["y"]) - .08)
+    u["w"] = max(lanes["A"]["x"] + lanes["A"]["w"], lanes["B"]["x"] + lanes["B"]["w"]) + .03 - u["x"]; u["h"] = max(lanes["A"]["y"] + lanes["A"]["h"], lanes["B"]["y"] + lanes["B"]["h"]) + .08 - u["y"]
+    d = 1 if cfg["finishX"] >= cfg["startX"] else -1
+    gob = next((b for b in au["beeps"] if b["f"] == 1760), None)
+    go, src = (cfg["goManual"], "set by host") if cfg.get("goManual") is not None else ((gob["t"], "GO beep heard in the audio") if gob else (None, ""))
+    times, boats, motion, prev = [], dict(A=[], B=[]), [], None
+    for t, fr in F.sample(fps):
+        times.append(t); P = planes(fr); ms = {}
+        for tm in "AB":
+            m = color_mask(P, M[tm], u, True); ms[tm] = m
+            bl = [b for b in blobs(m, 6) if b["area"] > .0004]
+            boats[tm].append(dict(**{k: bl[0][k] for k in ("x", "y", "w", "h", "cx", "cy")}, front=bl[0]["x"] + bl[0]["w"] if d > 0 else bl[0]["x"]) if bl else None)
+        g = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY).astype(np.int16); nb = (ms["A"] == 0) & (ms["B"] == 0); mv = dict(A=0, B=0)
+        if prev is not None:
+            mov = nb & prev[1] & (np.abs(g - prev[0]) > 35); Hh, W = mov.shape
+            for tm in "AB":
+                b = boats[tm][-1]
+                if not b: continue
+                r = dict(x=b["x"] - b["w"] * .6, y=b["y"] - b["h"] * .6, w=b["w"] * 2.2, h=b["h"] * 2.2)
+                mv[tm] = count_in(mov.astype(np.uint8), r) * r["w"] * r["h"] / max(1e-9, b["w"] * b["h"])
+        motion.append(mv); prev = (g, nb)
+    events, res = [], {}
+    def ev(**e): events.append(dict(id=f"e{len(events) + 1}", status="ai", **e))
+    for tm in "AB":
+        B = boats[tm]; first = [b for b in B[:max(3, round(fps * .4))] if b]; x0 = float(np.median([b["cx"] for b in first])) if first else None
+        if go is not None and x0 is not None:
+            for k, t in enumerate(times):
+                if t >= go - .05: break
+                if B[k] and (B[k]["cx"] - x0) * d > .02:
+                    ev(t=t, type="false_start", team=tm, pen=cfg["pen"]["falseStart"], conf=.85, reason=f"boat moved {abs(B[k]['cx'] - x0) * 100:.1f}% of the frame forward {go - t:.2f}s before GO"); break
+        run, inx = 0, False
+        for k, t in enumerate(times):
+            b = B[k]
+            if not b or (go is not None and t < go): run = 0; continue
+            out = b["cy"] < lanes[tm]["y"] or b["cy"] > lanes[tm]["y"] + lanes[tm]["h"]; run = run + 1 if out else 0
+            if run == 2 and not inx: inx = True; ev(t=times[k - 1], type="lane", team=tm, pen=cfg["pen"]["lane"], conf=.8, reason="boat centre left its lane for at least %.2fs" % (2 / fps))
+            if not out: inx = False
+        lock = -1
+        for k in range(1, len(times)):
+            if times[k] < lock: continue
+            m = motion[k][tm]
+            if m > .15 or (m > .1 and m + motion[k - 1][tm] > .25):
+                ev(t=times[k - 1], type="touch", team=tm, pen=cfg["pen"]["touch"], conf=.5, reason=f"something other than the boat moved right next to it ({round(m * 100)}% of boat size). Could be a hand, so check the replay."); lock = times[k] + 1.5
+        fin = None
+        for k in range(1, len(times)):
+            a, b = B[k - 1], B[k]
+            if a and b and (a["front"] - cfg["finishX"]) * d < 0 <= (b["front"] - cfg["finishX"]) * d:
+                uu = (cfg["finishX"] - a["front"]) / ((b["front"] - a["front"]) or 1e-6); fin = times[k - 1] + uu * (times[k] - times[k - 1]); break
+        res[tm] = dict(finish=round(fin, 2) if fin is not None else None, raw=round(fin - go, 2) if fin is not None and go is not None else None, visible=round(sum(1 for b in B if b) / max(1, len(B)), 2))
+        if fin is not None: ev(t=round(fin, 2), type="finish", team=tm, conf=.9, reason="front of the boat crossed the finish line" + (f"; {fin - go:.2f}s after GO" if go is not None else ""))
+    if go is not None: ev(t=go, type="go", conf=.9 if src.startswith("GO") else 1, reason=f"official start: {src}")
+    events.sort(key=lambda e: e["t"]); lim = []
+    if go is None: lim.append("No GO beep found in the audio. Set the start time by hand in the app.")
+    for tm in "AB":
+        if res[tm]["finish"] is None: lim.append(f"Team {tm} boat never crossed the finish line in the clip.")
+    lim.append("Touch detection looks for movement next to the boat; it can't see actual contact.")
+    overlay = [dict(t=t, p=[[tm, round(boats[tm][k]["x"], 4), round(boats[tm][k]["y"], 4), round(boats[tm][k]["w"], 4), round(boats[tm][k]["h"], 4), 0] for tm in "AB" if boats[tm][k]], b=None) for k, t in enumerate(times)]
+    return F, dict(facts=dict(go=go, goSource=src, boats=res, fps=fps), events=events, limitations=lim, audio=dict(hasAudio=au["hasAudio"], beeps=len(au["beeps"]))), overlay
+
+
+# ---------------- al-karamah ----------------
+def karamah(path, cfg, au, _):
+    F = Frames(path); fps = cfg.get("fps", 6); objs = cfg["objects"]; M = [matcher(o["color"], cfg.get("tol", 1)) for o in objs]
+    gob = next((b for b in au["beeps"] if b["f"] == 1760), None)
+    if cfg.get("startManual") is not None: start, src = cfg["startManual"], "set by host"
+    elif gob: start, src = gob["t"], "start beep heard in the audio"
+    else: start, src = 0, "start of the clip (no start beep heard)"
+    times, frac = [], []
+    for t, fr in F.sample(fps):
+        times.append(t); P = planes(fr)
+        frac.append([[count_in(color_mask(P, M[i]), z["zone"]) for z in objs] for i in range(len(objs))])
+    base = [[min(f[i][j] for f in frac[:3]) for j in range(len(objs))] for i in range(len(objs))]
+    placed = []
+    for i in range(len(objs)):
+        for j in range(len(objs)):
+            thr, run = max(.08, base[i][j] + .07), 0
+            for k in range(len(times)):
+                run = run + 1 if frac[k][i][j] > thr else 0
+                if run == 3:
+                    if times[k - 2] >= start - .3: placed.append(dict(obj=i, zone=j, t=times[k - 2], cov=frac[k][i][j]))
+                    break
+    placed.sort(key=lambda p: p["t"]); events, correct, wrong = [], [], []
+    def ev(**e): events.append(dict(id=f"e{len(events) + 1}", status="ai", **e))
+    for p in placed:
+        o, z = objs[p["obj"]], objs[p["zone"]]
+        if p["obj"] == p["zone"]: correct.append(p); ev(t=round(p["t"], 2), type="placed_ok", obj=o["id"], conf=.85 if p["cov"] > .2 else .6, reason=f"{o['name']} colour filled {round(p['cov'] * 100)}% of its target spot")
+        else: wrong.append(p); ev(t=round(p["t"], 2), type="placed_wrong", obj=o["id"], zone=z["id"], conf=.75 if p["cov"] > .2 else .5, reason=f"{o['name']} was put in the {z['name']} spot")
+    first = [next((p["t"] for p in correct if p["obj"] == i), None) for i in range(len(objs))]
+    missing = [objs[i]["id"] for i, f in enumerate(first) if f is None]; done = None if missing else max(first)
+    if done is not None: ev(t=round(done, 2), type="complete", conf=.8, reason=f"all items in place {done - start:.2f}s after the start")
+    ev(t=round(start, 2), type="go", conf=.9 if src.startswith("start beep") else .6, reason=f"round start: {src}")
+    events.sort(key=lambda e: e["t"]); lim = [f"{next(o['name'] for o in objs if o['id'] == m)} was never seen in its target spot." for m in missing]
+    lim.append("Items are recognised by colour inside each marked spot; similar-coloured things in a spot can fool it.")
+    overlay = [dict(t=t, p=[], b=None, z=[round(frac[k][i][i], 3) for i in range(len(objs))]) for k, t in enumerate(times)]
+    facts = dict(start=start, startSource=src, completeAt=done, completion=round(done - start, 2) if done is not None else None, order=[objs[p["obj"]]["id"] for p in correct], missing=missing,
+                 wrong=[dict(obj=objs[w["obj"]]["id"], zone=objs[w["zone"]]["id"], t=round(w["t"], 2)) for w in wrong], fps=fps)
+    return F, dict(facts=facts, events=events, limitations=lim, audio=dict(hasAudio=au["hasAudio"], beeps=len(au["beeps"]))), overlay
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Yalla Play! Python AI judge")
+    ap.add_argument("game", choices=["football", "dhow", "karamah"]); ap.add_argument("video")
+    ap.add_argument("--config", required=True, help="yalla_config.json from the app"); ap.add_argument("--key", required=True, help="judge code shown in the app, e.g. YP-ABCD-1234")
+    ap.add_argument("--yolo", action="store_true", help="football: use YOLOv8n + ByteTrack (pip install ultralytics)"); ap.add_argument("--out", help="output report path")
+    a = ap.parse_args()
+    raw = json.load(open(a.config, encoding="utf-8")); cfg = raw.get("config", raw)
+    if raw.get("game") and raw["game"] != a.game: sys.exit(f"This config is for {raw['game']}, not {a.game}.")
+    sha = hashlib.sha256(open(a.video, "rb").read()).hexdigest()
+    if raw.get("video_sha256") and raw["video_sha256"] != sha: print("Warning: this isn't the same video file that was loaded in the app; the app will refuse the report.")
+    print("Listening to the audio…"); au = analyse_audio(load_audio(a.video))
+    print(f"  {len(au['whistles'])} whistle(s), {len(au['beeps'])} beep(s), {len(au['cheers'])} loud moment(s)" if au["hasAudio"] else "  no audio (or ffmpeg not found)")
+    print("Watching the video…")
+    F, out, overlay = {"football": football, "dhow": dhow, "karamah": karamah}[a.game](a.video, cfg, au, a.yolo)
+    report = dict(engine=ENGINE, game=a.game, matchId=raw.get("matchId"), turn=raw.get("turn"), video=dict(name=os.path.basename(a.video), sha256=sha, duration=round(F.duration, 2)),
+                  createdAt=datetime.datetime.now(datetime.timezone.utc).isoformat(), config=cfg, **out)
+    payload = json.dumps(report, ensure_ascii=False, separators=(",", ":"))
+    sig = hmac.new(a.key.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    path = a.out or os.path.splitext(a.video)[0] + "_yalla_report.json"
+    json.dump(dict(format="yalla-judge-report/1", payload=payload, sig=sig, overlay=overlay), open(path, "w", encoding="utf-8"), ensure_ascii=False)
+    print(f"\n{len(out['events'])} game moments found:")
+    for e in out["events"]: print(f"  {fmt(e['t'])}  {e['type']:<13} conf {e.get('conf', 1):.2f}  {e.get('reason', '')}")
+    print(f"\nSigned report written to {path}\nImport it in the app's AI judge step (Use the Python AI judge → Import).")
+
+
+if __name__ == "__main__":
+    main()
