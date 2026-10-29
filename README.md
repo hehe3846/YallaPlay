@@ -30,3 +30,4 @@ python yalla_judge.py karamah turn1.mp4 --config yalla_config.json --key YP-ABCD
 
 The report's `payload` is signed with HMAC-SHA256 using the judge code as the key. The app recomputes the signature and refuses the report if a single character was changed. It also compares the SHA-256 fingerprint of the video in the report with the video loaded in the app.
 
+link to prototype: https://golden-summit-47.nippy.site/yallaplay/dist/
